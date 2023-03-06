@@ -266,11 +266,11 @@ class WindowAttention(nn.Module):
         self.to_v = nn.Sequential(nn.Linear(dim, num_heads * self.dim_head, bias=qkv_bias))
 
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim * num_cams, dim)
+        self.proj = nn.Linear(self.num_heads * self.dim_head, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.add_qproj=nn.Linear(self.num_cams*dim,dim)
+        self.add_qproj = nn.Linear(self.num_cams * dim, dim)
         self.softmax = nn.Softmax(dim=-1)
-        self.prenorm = norm(self.dim * self.num_cams)
+        self.prenorm = norm(self.num_heads * self.dim_head)
         self.mlp = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
 
     def forward(self, q, k, v):
@@ -280,14 +280,16 @@ class WindowAttention(nn.Module):
 #         v: (b n d h w)
 #         """
         B, n, d, H, W = q.shape
-        add_q=q.clone()
-        add_q= rearrange(add_q, 'b n d H W -> b H W (n d)')
-        add_q=self.add_qproj(add_q)
-        #add_q.shape b, H W d
-        add_q=rearrange(add_q, 'b H W d-> b (H W) d)')
+        add_q = q.clone()
+        add_q = rearrange(add_q, 'b n d H W -> b H W (n d)')
+        add_q = self.add_qproj(add_q)
+        # add_q.shape b, H W d
+        add_q = rearrange(add_q, 'b H W d-> b (H W) d')
         # Move feature dim to last for multi-head proj
         q = rearrange(q, 'b n d H W -> b n (H W) d')  # 6，6，128，25，25到6，6，625，128
         # Project with multiple heads
+        k = rearrange(k, 'b n d h w -> b n h w d ')
+        v = rearrange(v, 'b n d h w -> b n h w d ')
         q = self.to_q(q)
         k = self.to_k(k)
         v = self.to_v(v)
@@ -296,36 +298,38 @@ class WindowAttention(nn.Module):
         v = rearrange(v, 'b n h w d -> (b n) d h w ')
         k = self.pool(k)
         v = self.pool(v)
+
         # k,v.shape b*n,d 14 14
         _, _, hk, wk = k.shape
         k = rearrange(k, '(b n) d h w -> b n h w d', b=B, n=n)
         v = rearrange(v, '(b n) d h w -> b n h w d', b=B, n=n)
-        k = rearrange(k, 'b n d h w -> b n (h w) d')
-        v = rearrange(v, 'b n d h w -> b (n h w) d')
-        #Group the head dim with batch dim
+        k = rearrange(k, ' b n h w d -> b n (h w) d')
+        v = rearrange(v, ' b n h w d -> b (n h w) d')
+        # Group the head dim with batch dim
         q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.num_heads, d=self.dim_head)  # 24，6，625，32
         k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.num_heads, d=self.dim_head)  # 24，6，6270，32
         v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.num_heads, d=self.dim_head)
-        #q.shape b*nH  n (H W)   d/nH
-        #k.shape b*nH  n (hk wk) d/nH
-        #v.shape b*nH  (n hk wk) d/nH
+        # q.shape b*nH  n (H W)   d/nH
+        # k.shape b*nH  n (hk wk) d/nH
+        # v.shape b*nH  (n hk wk) d/nH
 
-        #Dot product attention along cameras
-        dot = self.scale * torch.einsum('b n Q d, b n K d -> b n Q K', q,k)  # 后面那个 shape=24，6，625，6720  dot 24,6,625,6720
+        # Dot product attention along cameras
+        dot = self.scale * torch.einsum('b n Q d, b n K d -> b n Q K', q,
+                                        k)  # 后面那个 shape=24，6，625，6720  dot 24,6,625,6720
         dot = rearrange(dot, 'b n Q K -> b Q (n K)')  # dot 24,625,40320
         attn = self.softmax(dot)
         # attn (b*nH,n, H*W,hk*wk)→(b*nH H*W (n hk wk))
         attn = self.attn_drop(attn)
-        #a .shape (b * nH  H*W  d/nH)
+        # a .shape (b * nH  H*W  d/nH)
         a = torch.einsum('b Q K, b K d -> b Q d', attn, v)  # shape 24,625,32
-        x = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)  # torch.Size([6, 625, 128])
-        #x.shape b H*W d
+        x = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.num_heads, d=self.dim_head)  # torch.Size([6, 625, 128])
+        # x.shape b H*W d
 
         x = self.prenorm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
-        x=x+add_q
-        # x.shape B,H,W,d
+        x = x + add_q
+        # x.shape B,H*W,d
         x = x + self.norm(self.mlp(x))
         x = rearrange(x, 'b (H W) d -> b d H W', H=H, W=W)
         return x
